@@ -10,7 +10,7 @@
 bl_info = {
     'name': 'Banging Cuts',
     'author': 'Funkster',
-    'version': (0, 5),
+    'version': (0, 8),
     'blender': (2, 80, 0),
     'description': 'Banging Cuts addon for Blender VSE. Chop bits out of your strips in sync with audio peaks!',
     'category': 'Sequencer',
@@ -35,27 +35,29 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
         description='audio level threshold for trigger',
         default=-15.0,
         max=-0.1,
-        )
+    )
         
     frames_preroll: bpy.props.IntProperty(
         name='Preroll frames',
         description='how many frames to keep before the trigger',
         default=1,
         min=0,
-        )
+    )
         
     frames_postroll: bpy.props.IntProperty(
         name='Postroll',
         description='how many frames to keep after the trigger',
         default=5,
         min=1,
-        )
+    )
     
-    auto_holdoff: bpy.props.BoolProperty(
-        name='Auto holdoff',
-        description="don't allow retrigger until level drops below threshold",
-        default=True,
-        )
+    operation_mode: bpy.props.EnumProperty(
+        items=( ('BANG', 'Bang (Auto Holdoff)', 'Isolate fixed-length clips at start of sections above threshold, don\'t retrigger'),
+                ('REMSILENCE', 'Remove Silence', 'Isolate variable-length clips where audio remains above threshold'),
+                ('NAIVE', 'Naive', 'Bang but with no auto-holdoff. Maybe never useful.')),
+        name = "Operation Mode",
+        default=0,
+    )
     
     def invoke(self, context, event):
         wm = context.window_manager
@@ -68,7 +70,7 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
         thresh_falling = pow(10,(self.audio_thresh_db - 2) / 20.0)
         scene = context.scene
         actual_fps = scene.render.fps / scene.render.fps_base
-        samplerate = scene.render.ffmpeg.audio_mixrate
+        scene_samplerate = scene.render.ffmpeg.audio_mixrate
         reference_start = 0
         wm = context.window_manager
         soundstrips = []
@@ -96,16 +98,21 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
         dataarray = audsound.data()
         audiochannels = dataarray.shape[1]
         numsamples = dataarray.shape[0]
+        # can't get the strip's samplerate directly, so work it out the hard way...
+        strip_samplerate = numsamples / (ref_strip.frame_duration / actual_fps)
         if DEBUG:
             self.report({'INFO'}, 'Ref strip has {} channels, {} samples per channel!'.format(audiochannels, numsamples))
+            self.report({'INFO'}, 'start_offset is {}, actual_fps is {}, scene_samplerate is {}, strip_samplerate is {}, frame_final_duration is {}'.format(start_offset, actual_fps, scene_samplerate, strip_samplerate, ref_strip.frame_final_duration))
         # only start looking where the ref_strip actually starts
-        startsample = int((start_offset / actual_fps) * samplerate)
+        startsample = int((start_offset / actual_fps) * strip_samplerate)
         # and only look until where the ref strip ends, even if the audio itself is longer
-        endsample = startsample + int((ref_strip.frame_final_duration / actual_fps) * samplerate)
+        endsample = startsample + int((ref_strip.frame_final_duration / actual_fps) * strip_samplerate)
         # leave room for the first preroll
-        startsample += int(((self.frames_preroll + 1) / actual_fps) * samplerate)
+        startsample += int(((self.frames_preroll + 1) / actual_fps) * strip_samplerate)
         # add some room at the end so that we always have room for the last post-roll
-        endsample -= int(((self.frames_postroll + 1) / actual_fps) * samplerate)
+        endsample -= int(((self.frames_postroll + 1) / actual_fps) * strip_samplerate)
+        if DEBUG:
+            self.report({'INFO'}, 'startsample is {}, endsample is {}'.format(startsample, endsample))
         
         # ready to look for peaks!
         frame = 0
@@ -114,8 +121,10 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
         progress_prev = 0
         triggered = False
         sampleindex = startsample
+        inpoint = 0
+        outpoint = 0
         while sampleindex < endsample:
-            frame = actual_fps * (sampleindex / samplerate)
+            frame = actual_fps * (sampleindex / strip_samplerate)
             if triggered:
                 if dataarray[sampleindex][0] < thresh_falling and dataarray[sampleindex][0] > (0 - thresh_falling):
                     trigger_debounce += 1
@@ -124,10 +133,19 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
                             self.report({'INFO'}, 'Back below threshold at frame {}'.format(frame))
                         triggered = False
                         trigger_debounce = 0
+                        if self.operation_mode == 'REMSILENCE':
+                            # variable-length clips
+                            outpoint = int(frame + self.frames_postroll)
+                            if len(edits) != 0 and inpoint < edits[len(edits) - 1][1]:
+                                # this inpoint is before the last clip's outpoint, merge the two
+                                edits[len(edits) - 1][1] = outpoint
+                            else:
+                                edits.append([inpoint, outpoint])
+                            # don't advance for post/pre-roll compensation, as the clip-merging deals with that.
                 else:
                     trigger_debounce = 0
             elif dataarray[sampleindex][0] > thresh_rising or dataarray[sampleindex][0] < (0 - thresh_rising):
-                if self.auto_holdoff:
+                if self.operation_mode != 'NAIVE':
                     if DEBUG:
                         self.report({'INFO'}, 'Marking trigger active for holdoff at frame {}'.format(frame))
                     triggered = True
@@ -135,18 +153,30 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
                 inpoint = int(frame - self.frames_preroll)
                 if inpoint < 0:
                     inpoint = 0
-                outpoint = int(frame + self.frames_postroll)
-                edits.append([inpoint, outpoint])
-                # advance until after postroll since we have already got this one
-                sampleindex += int((self.frames_postroll / actual_fps) * samplerate)
-                # also advance until after next preroll so we don't get repeats
-                sampleindex += int((self.frames_preroll / actual_fps) * samplerate)
+                if self.operation_mode != 'REMSILENCE':
+                    # fixed-length clips
+                    outpoint = int(frame + self.frames_postroll)
+                    edits.append([inpoint, outpoint])
+                    # advance until after postroll since we have already got this one
+                    sampleindex += int((self.frames_postroll / actual_fps) * strip_samplerate)
+                    # also advance until after next preroll so we don't get repeats
+                    sampleindex += int((self.frames_preroll / actual_fps) * strip_samplerate)
             sampleindex += 1
             progress = int((100 * (sampleindex - startsample)) / (endsample - startsample))
             if progress_prev != progress:
                 progress_prev = progress
                 wm.progress_update(progress)
         wm.progress_end()
+        # deal with the case of the audio clip ending before falling back below threshold when removing silence
+        if triggered and self.operation_mode == 'REMSILENCE':
+            # variable-length clips
+            outpoint = int(frame + self.frames_postroll)
+            if len(edits) != 0 and inpoint < edits[len(edits) - 1][1]:
+                # this inpoint is before the last clip's outpoint, merge the two
+                edits[len(edits) - 1][1] = outpoint
+            else:
+                edits.append([inpoint, outpoint])
+            
         # TODO: do we need to delete the audsound object and/or clear the cache? or is that taken care of by the script exiting?
 
         if len(edits) == 0:
@@ -157,7 +187,7 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
         clip_starts = []
         clip_starts.append(edits[0][0] + reference_start)
         for edit_index in range(1, len(edits)):
-            clip_starts.append(clip_starts[edit_index - 1] + self.frames_preroll + self.frames_postroll)
+            clip_starts.append(clip_starts[edit_index - 1] + (edits[edit_index - 1][1] - edits[edit_index - 1][0]))
             if DEBUG:
                 self.report({'INFO'}, 'Final position {} start {}'.format(edit_index, clip_starts[edit_index]))
         
@@ -186,7 +216,7 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
                         # nothing to trim off and bin from before the good bit
                         newstrip_bin = None
                     else:
-                        newstrip_keep = newstrip_keep.split(frame=edits[edit_index][0] + strip_hard_start + ref_offset, split_method='SOFT')
+                        newstrip_keep = newstrip_keep.split(frame=(int)(edits[edit_index][0] + strip_hard_start + ref_offset), split_method='SOFT')
                         bpy.context.scene.sequence_editor.sequences.remove(newstrip_bin)
                     keeps.append(newstrip_keep)
                     if edits[edit_index][1] + strip_hard_start + ref_offset >= (newstrip_keep.frame_start + newstrip_keep.frame_offset_start + newstrip_keep.frame_final_duration):
@@ -194,7 +224,7 @@ class BANGING_CUTS_OT_make_cuts(bpy.types.Operator):
                         newstrip_bin = None
                         break
                     # make the cut at the outpoint of the good bit, and set the clip to be binned next time round
-                    newstrip_bin = newstrip_keep.split(frame=edits[edit_index][1] + strip_hard_start + ref_offset, split_method='SOFT')
+                    newstrip_bin = newstrip_keep.split(frame=(int)(edits[edit_index][1] + strip_hard_start + ref_offset), split_method='SOFT')
                     newstrip_keep = newstrip_bin
                 # delete the final unused bit, if it exists
                 if newstrip_bin is not None and newstrip_bin.frame_final_duration > 0:
