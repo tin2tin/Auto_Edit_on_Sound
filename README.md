@@ -1,5 +1,5 @@
-# Banging Cuts
-Blender VSE Addon to cut up audio and video clips based on peaks in the audio track.
+# Auto Edit on Sound
+Blender VSE Addon to cut up audio and video clips to remove silence or assemble audio peaks.
 
 ## Why?
 I got bored of doing this kind of editing manually.
