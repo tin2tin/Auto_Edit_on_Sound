@@ -1,4 +1,4 @@
-# Auto Edit on Sound
+# Auto Edit on Sound by Olly Funkster
 Blender VSE Addon to cut up audio and video clips to remove silence or assemble audio peaks.
 
 ## Why?
