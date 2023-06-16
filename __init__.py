@@ -11,7 +11,7 @@ bl_info = {
     'name': 'Banging Cuts',
     'author': 'Funkster',
     'version': (0, 8),
-    'blender': (2, 80, 0),
+    'blender': (3, 4, 0),
     'description': 'Banging Cuts addon for Blender VSE. Chop bits out of your strips in sync with audio peaks!',
     'category': 'Sequencer',
 }
