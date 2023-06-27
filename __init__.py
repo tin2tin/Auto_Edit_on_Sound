@@ -8,7 +8,7 @@
 # You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>
 
 bl_info = {
-    'name': 'Banging Cuts',
+    'name': 'Auto Edit on Sound',
     'author': 'Funkster',
     'version': (0, 8),
     'blender': (3, 4, 0),
